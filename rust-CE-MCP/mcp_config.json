@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cheat-engine": {
+      "command": "python",
+      "args": [
+        "C:\\Users\\Administrator\\Downloads\\CE-MCP-Plugin-CE-MCP-Plugin\\CE-MCP-Plugin-CE-MCP-Plugin\\rust-CE-MCP\\bridge_server.py",
+        "--host", "127.0.0.1",
+        "--port", "8888"
+      ]
+    }
+  }
+}
