@@ -86,4 +86,4 @@
 *   **解决**: 插件内部已处理 UTF-8 转换，但请确保您的系统和 CE 字体支持中文显示。
 
 ---
-基于https://github.com/Eruditi/CE-MCP-Plugin
+https://github.com/Eruditi/CE-MCP-Plugin
