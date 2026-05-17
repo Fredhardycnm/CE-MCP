@@ -1,3 +1,22 @@
+"""
+CE-MCP 桥接服务器（Python）
+
+本模块是 AI ↔ Cheat Engine 通信的中间桥梁，实现 MCP（Model Context Protocol）协议。
+
+工作流程:
+  AI (Claude/Cursor 等)  ──JSON-RPC──>  bridge_server.py  ──TCP文本协议──>  CE 插件 (Rust DLL)
+
+角色定位:
+  1. 作为 MCP Server，通过 stdin/stdout 接收 AI 的 JSON-RPC 2.0 请求
+  2. 解析 AI 的 tool 调用请求，将其翻译为 CE 插件能理解的 TCP 文本命令
+  3. 维护 TCP Server 端口（默认 8888），等待 CE 插件连接
+  4. 将 CE 插件返回的响应转发回 AI
+
+通信协议:
+  - AI → 本服务器: JSON-RPC 2.0 over stdin/stdout（标准 MCP 协议）
+  - 本服务器 → CE 插件: TCP 文本命令（格式: COMMAND:参数1,参数2,...）
+"""
+
 import socket
 import sys
 import json
@@ -7,30 +26,52 @@ import time
 import argparse
 from typing import Optional, Dict, Any
 
-# Simple MCP Protocol Implementation
-# Reads from stdin, writes to stdout
-# JSON-RPC 2.0
 
 class BridgeServer:
+    """MCP 桥接服务器
+
+    职责:
+      1. 启动 TCP Server 等待 CE 插件连接
+      2. 通过 stdin 读取 AI 的 JSON-RPC 请求
+      3. 将 AI 请求转换为文本命令转发到 CE
+      4. 将 CE 响应回传给 AI
+
+    属性:
+      host: TCP 绑定地址（默认 127.0.0.1）
+      port: TCP 端口（默认 8888）
+      conn: CE 插件的 TCP 连接
+      response_queue: CE 响应队列（线程安全）
+      running: 服务器运行标志
+    """
+
     def __init__(self, host='127.0.0.1', port=8888):
+        """初始化桥接服务器
+
+        Args:
+            host: TCP 服务器绑定地址
+            port: TCP 服务器端口
+        """
         self.host = host
         self.port = port
-        self.conn: Optional[socket.socket] = None
-        self.response_queue = queue.Queue()
+        self.conn: Optional[socket.socket] = None       # CE 插件 TCP 连接
+        self.response_queue = queue.Queue()             # 接收 CE 响应的队列
         self.running = True
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()                    # 线程锁，保证发送/接收同步
 
     def start_tcp_server(self):
+        """启动 TCP 服务器，监听 CE 插件连接
+
+        在独立线程中运行，接受 CE 插件连接后调用 handle_connection 处理。
+        支持断线重连，服务器不会因单次连接断开而退出。
+        """
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind((self.host, self.port))
         server_sock.listen(1)
-        # print(f"Listening on {self.host}:{self.port} for CE Plugin...", file=sys.stderr)
-        
+
         while self.running:
             try:
                 conn, addr = server_sock.accept()
-                # print(f"Connected by {addr}", file=sys.stderr)
                 self.conn = conn
                 self.handle_connection(conn)
             except Exception as e:
@@ -39,34 +80,48 @@ class BridgeServer:
                     time.sleep(1)
 
     def handle_connection(self, conn):
-        buffer = ""
+        """处理与 CE 插件的 TCP 连接
+
+        持续接收 CE 插件发来的响应数据，存入 response_queue。
+
+        Args:
+            conn: 已建立的 TCP socket 连接
+        """
         while self.running:
             try:
                 data = conn.recv(4096)
                 if not data:
                     break
-                
+
                 text = data.decode('utf-8', errors='ignore')
                 self.response_queue.put(text)
-                
+
             except Exception as e:
                 print(f"Connection error: {e}", file=sys.stderr)
                 break
         self.conn = None
 
     def send_command(self, cmd: str) -> str:
+        """向 CE 插件发送文本命令并等待响应
+
+        Args:
+            cmd: 文本命令字符串（如 "READ_MEMORY:0x123456,float"）
+
+        Returns:
+            CE 插件的响应字符串，或错误信息
+        """
         if not self.conn:
             return "Error: Cheat Engine not connected"
-        
+
         try:
             with self.lock:
-                # Clear queue
+                # 清空响应队列
                 while not self.response_queue.empty():
                     self.response_queue.get()
-                
+
                 self.conn.sendall(cmd.encode('utf-8'))
-                
-                # Wait for response (timeout 5s)
+
+                # 等待 CE 响应（超时 5 秒）
                 try:
                     return self.response_queue.get(timeout=5)
                 except queue.Empty:
@@ -75,11 +130,18 @@ class BridgeServer:
             return f"Error: {e}"
 
     def run_mcp_loop(self):
-        # Start TCP server in background
+        """运行 MCP 主循环
+
+        1. 启动 TCP 服务器线程等待 CE 连接
+        2. 通过 sys.stdin 读取 AI 发来的 JSON-RPC 请求
+        3. 逐个请求调用 handle_rpc_request 处理
+        4. 将处理结果（JSON-RPC 响应）打印到 stdout
+        """
+        # 在后台线程中启动 TCP 服务器
         t = threading.Thread(target=self.start_tcp_server, daemon=True)
         t.start()
 
-        # Read JSON-RPC from stdin
+        # 主线程：从 stdin 读取 AI 的 JSON-RPC 请求
         for line in sys.stdin:
             try:
                 request = json.loads(line)
@@ -93,13 +155,28 @@ class BridgeServer:
                 print(f"Error handling request: {e}", file=sys.stderr)
 
     def handle_rpc_request(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """处理单个 JSON-RPC 请求
+
+        支持三种 MCP 方法:
+          1. initialize            — MCP 握手初始化
+          2. notifications/initialized — 初始化完成通知（无响应）
+          3. tools/list            — 返回所有可用工具列表
+          4. tools/call            — 调用具体工具（翻译为 TCP 文本命令）
+
+        Args:
+            request: JSON-RPC 请求字典
+
+        Returns:
+            JSON-RPC 响应字典，或 None（无需响应的情况）
+        """
         if "method" not in request:
             return None
-        
+
         method = request["method"]
         msg_id = request.get("id")
         params = request.get("params", {})
 
+        # ── MCP 握手：返回服务器信息与能力声明 ──
         if method == "initialize":
             return {
                 "jsonrpc": "2.0",
@@ -115,23 +192,25 @@ class BridgeServer:
                     }
                 }
             }
-        
+
+        # ── MCP 初始化完成通知：无需响应 ──
         if method == "notifications/initialized":
             return None
 
+        # ── 工具列表查询：返回所有 CE 操作工具的定义 ──
         if method == "tools/list":
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
                     "tools": [
-                        # --- Basic ---
+                        # ── 基础 ──
                         {
                             "name": "show_message",
                             "description": "Show a message box in Cheat Engine",
                             "inputSchema": { "type": "object", "properties": { "message": {"type": "string"} }, "required": ["message"] }
                         },
-                        # --- Process ---
+                        # ── 进程管理 ──
                         {
                             "name": "open_process",
                             "description": "Open a process by ID",
@@ -157,7 +236,7 @@ class BridgeServer:
                             "description": "Attach debugger to process",
                             "inputSchema": { "type": "object", "properties": { "process_id": {"type": "integer"} }, "required": ["process_id"] }
                         },
-                        # --- Advanced ---
+                        # ── 高级功能 ──
                         {
                             "name": "change_register",
                             "description": "Change register value at address",
@@ -213,7 +292,7 @@ class BridgeServer:
                             "description": "Continue from breakpoint",
                             "inputSchema": { "type": "object", "properties": { "option": {"type": "integer"} }, "required": ["option"] }
                         },
-                        # --- Memory ---
+                        # ── 内存读写 ──
                         {
                             "name": "read_memory",
                             "description": "Read memory from the current process in Cheat Engine",
@@ -224,7 +303,7 @@ class BridgeServer:
                             "description": "Write value to memory",
                             "inputSchema": { "type": "object", "properties": { "address": {"type": "string"}, "value": {"type": "string"}, "type": {"type": "string"} }, "required": ["address", "value", "type"] }
                         },
-                        # --- Assembly ---
+                        # ── 汇编与反汇编 ──
                         {
                             "name": "assemble",
                             "description": "Assemble instruction at address",
@@ -240,7 +319,7 @@ class BridgeServer:
                             "description": "Execute Auto Assembler script",
                             "inputSchema": { "type": "object", "properties": { "script": {"type": "string"} }, "required": ["script"] }
                         },
-                        # --- Table Management ---
+                        # ── 地址列表（Table）管理 ──
                         {
                             "name": "create_table_entry",
                             "description": "Create a new entry in the cheat table",
@@ -316,7 +395,7 @@ class BridgeServer:
                             "description": "Delete a table entry",
                             "inputSchema": { "type": "object", "properties": { "index": {"type": "integer"} }, "required": ["index"] }
                         },
-                        # --- UI Controls ---
+                        # ── UI 控件 ──
                         {
                             "name": "create_form",
                             "description": "Create a new form",
@@ -374,7 +453,7 @@ class BridgeServer:
                         },
                         {
                             "name": "image_bool",
-                            "description": "Set boolean property for image (0:Transparent, 1:Stretch)",
+                            "description": "Set image boolean property (0:Transparent, 1:Stretch)",
                             "inputSchema": { "type": "object", "properties": { "image": {"type": "integer"}, "value": {"type": "boolean"}, "type_id": {"type": "integer"} }, "required": ["image", "value", "type_id"] }
                         },
                         {
@@ -386,16 +465,17 @@ class BridgeServer:
                 }
             }
 
+        # ── 工具调用：翻译 AI 请求为 TCP 文本命令发送到 CE ──
         if method == "tools/call":
             tool_name = params.get("name")
             args = params.get("arguments", {})
             result_text = ""
-            
-            # --- Basic ---
+
+            # ── 基础 ──
             if tool_name == "show_message":
                 result_text = self.send_command(f"SHOW_MESSAGE:{args['message']}")
-            
-            # --- Process ---
+
+            # ── 进程管理 ──
             elif tool_name == "open_process":
                 result_text = self.send_command(f"OPEN_PROCESS:{args['process_id']}")
             elif tool_name == "get_process_id":
@@ -407,7 +487,7 @@ class BridgeServer:
             elif tool_name == "debug_process":
                 result_text = self.send_command(f"DEBUG_PROCESS:{args['process_id']}")
 
-            # --- Advanced ---
+            # ── 高级功能 ──
             elif tool_name == "change_register":
                 result_text = self.send_command(f"CHANGE_REGISTER:{args['address']},{args['reg']},{args['value']}")
             elif tool_name == "inject_dll":
@@ -433,13 +513,13 @@ class BridgeServer:
             elif tool_name == "continue_from_breakpoint":
                 result_text = self.send_command(f"CONTINUE_FROM_BREAKPOINT:{args['option']}")
 
-            # --- Memory ---
+            # ── 内存读写 ──
             elif tool_name == "read_memory":
                 result_text = self.send_command(f"READ_MEMORY:{args['address']},{args['type']}")
             elif tool_name == "write_memory":
                 result_text = self.send_command(f"WRITE_MEMORY:{args['address']},{args['value']},{args['type']}")
 
-            # --- Assembly ---
+            # ── 汇编与反汇编 ──
             elif tool_name == "assemble":
                 result_text = self.send_command(f"ASSEMBLE:{args['address']},{args['instruction']}")
             elif tool_name == "disassemble":
@@ -447,7 +527,7 @@ class BridgeServer:
             elif tool_name == "auto_assemble":
                 result_text = self.send_command(f"AUTO_ASSEMBLE:{args['script']}")
 
-            # --- Table Management ---
+            # ── 地址列表（Table）管理 ──
             elif tool_name == "create_table_entry":
                 result_text = self.send_command(f"CREATE_TABLE_ENTRY:{args['description']},{args['address']},{args['type']}")
             elif tool_name == "get_table_entry":
@@ -479,7 +559,7 @@ class BridgeServer:
             elif tool_name == "delete_entry":
                 result_text = self.send_command(f"DELETE_ENTRY:{args['index']}")
 
-            # --- UI Controls ---
+            # ── UI 控件 ──
             elif tool_name == "create_form":
                 result_text = self.send_command("CREATE_FORM")
             elif tool_name == "create_control":
@@ -511,6 +591,7 @@ class BridgeServer:
             else:
                 result_text = f"Unknown tool: {tool_name}"
 
+            # 统一返回 JSON-RPC 响应
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -524,6 +605,7 @@ class BridgeServer:
                 }
             }
 
+        # ── 未知方法：返回错误 ──
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -533,12 +615,15 @@ class BridgeServer:
             }
         }
 
+
 if __name__ == "__main__":
+    # 命令行参数解析
     parser = argparse.ArgumentParser(description='Cheat Engine MCP Bridge Server')
     parser.add_argument('--host', default='127.0.0.1', help='TCP Host to bind to (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=8888, help='TCP Port to bind to (default: 8888)')
     args = parser.parse_args()
 
+    # 启动桥接服务器
     server = BridgeServer(host=args.host, port=args.port)
     try:
         server.run_mcp_loop()
