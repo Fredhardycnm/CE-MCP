@@ -1,0 +1,25 @@
+[package]
+name = "ce-mcp-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Cheat Engine MCP Plugin - AI Integration Plugin for Cheat Engine"
+authors = ["Eruditi"]
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+winapi = { version = "0.3", features = ["winuser", "minwindef", "windef", "libloaderapi", "processthreadsapi", "synchapi", "winbase", "winnt"] }
+lazy_static = "1.4"
+log = "0.4"
+simplelog = "0.12"
+crossbeam-channel = "0.5"
+obfstr = "0.4"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
